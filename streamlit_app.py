@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import time
@@ -11,7 +12,6 @@ st.set_page_config(page_title="Compresión de imágenes con SVD", layout="wide")
 # ---------------------------------------------------------------
 # DATOS DE ENTRADA
 # ---------------------------------------------------------------
-CARPETA = r"D:\PROGRAMACION\CODE\PRODUCTO ACREDITABLE\IMAGENES_FALABELLA"
 K_INICIAL = 50          # k con el que arranca la barra
 K_MAX_ALEATORIO = 200   # valores singulares que calcula el SVD aleatorio
 SOBREMUESTREO = 10      # columnas extra del SVD aleatorio (mejoran la precision)
@@ -19,20 +19,15 @@ ITERACIONES = 2         # iteraciones de potencia del SVD aleatorio
 SEMILLA = 42            # semilla fija: el SVD aleatorio se repite igual
 BYTES_VALOR = 4         # cada valor guardado ocupa 4 bytes (float32)
 CANALES = 3
+MAX_MEGAPIXELES = 6     # imagenes mas grandes se rechazan (protegen la memoria del servidor)
 
 
 # ---------------------------------------------------------------
 # FUNCIONES
 # ---------------------------------------------------------------
-def listar_imagenes(carpeta):
-    if not os.path.isdir(carpeta):
-        return []
-    return sorted([a for a in os.listdir(carpeta) if a.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))])
-
-
-def leer_imagen(ruta):
-    """Lee la imagen y la devuelve como matriz (alto, ancho, 3) con valores entre 0 y 1."""
-    image = plt.imread(ruta)
+def leer_imagen(datos, extension):
+    """Lee la imagen desde sus bytes y la devuelve como matriz (alto, ancho, 3) con valores entre 0 y 1."""
+    image = plt.imread(io.BytesIO(datos), format=extension)
     if image.dtype == np.uint8:
         image = image / 255.0
     if image.ndim == 2:
@@ -78,15 +73,16 @@ def calcular_svd(image, metodo):
     return svds, time.time() - tiempo_inicio
 
 
-# Versiones con memoria (cache): el SVD se calcula una sola vez por imagen y metodo
+# Versiones con memoria (cache): el SVD se calcula una sola vez por imagen y metodo.
+# Los parametros que empiezan con "_" no se usan para identificar la imagen (se usa la huella).
 @st.cache_resource(show_spinner=False, max_entries=4)
-def cargar_imagen(ruta, modificado):
-    return leer_imagen(ruta)
+def cargar_imagen(huella, _datos, extension):
+    return leer_imagen(_datos, extension)
 
 
 @st.cache_resource(show_spinner=False, max_entries=8)
-def calcular_svd_cache(ruta, modificado, metodo):
-    return calcular_svd(cargar_imagen(ruta, modificado), metodo)
+def calcular_svd_cache(huella, _datos, extension, metodo):
+    return calcular_svd(cargar_imagen(huella, _datos, extension), metodo)
 
 
 def reconstruir_color(svds, k):
@@ -143,6 +139,10 @@ def a_uint8(imagen):
     return (np.clip(imagen, 0, 1) * 255).round().astype(np.uint8)
 
 
+def extension_de(nombre):
+    return os.path.splitext(nombre)[1].lower().lstrip(".")
+
+
 def ir_a_recomendado(clave, valor):
     st.session_state[clave] = valor
 
@@ -153,11 +153,12 @@ ENCABEZADOS = ["Imagen", "Tamaño (px)", "Peso original (KB)", "k recomendado", 
                "Carga original (s)", "Carga SVD (s)"]
 
 
-def calcular_fila(archivo, umbral, velocidad):
+def calcular_fila(nombre, datos, umbral, velocidad):
     """Una fila de la tabla comparativa: los dos metodos sobre una imagen."""
-    ruta = os.path.join(CARPETA, archivo)
-    img = leer_imagen(ruta)
-    peso = os.path.getsize(ruta) / 1024
+    img = leer_imagen(datos, extension_de(nombre))
+    if img.shape[0] * img.shape[1] > MAX_MEGAPIXELES * 1e6:
+        raise ValueError("imagen demasiado grande")
+    peso = len(datos) / 1024
     svd_c, t_c = calcular_svd(img, "clasico")
     svd_a, t_a = calcular_svd(img, "aleatorio")
 
@@ -167,7 +168,7 @@ def calcular_fila(archivo, umbral, velocidad):
     err_a = calcular_error(img, reconstruir_color(svd_a, k_a))
     peso_svd = peso_npz_kb(svd_c, k_rec)
 
-    return [archivo, str(img.shape[1]) + "x" + str(img.shape[0]), round(peso, 1), k_rec, k_a,
+    return [nombre, str(img.shape[1]) + "x" + str(img.shape[0]), round(peso, 1), k_rec, k_a,
             round(peso_svd, 1), round(peso_svd / peso, 2), round(err_c * 100, 2), round(err_a * 100, 2),
             round(t_c, 2), round(t_a, 2), round(t_c / t_a, 1),
             round(segundos_de_carga(peso, velocidad), 2), round(segundos_de_carga(peso_svd, velocidad), 2)]
@@ -179,31 +180,45 @@ def calcular_fila(archivo, umbral, velocidad):
 st.sidebar.title("Compresión de imágenes con SVD")
 st.sidebar.caption("Caso de estudio: imágenes de productos de Falabella")
 
-archivos = listar_imagenes(CARPETA)
-if len(archivos) == 0:
-    st.error("No se encontraron imágenes en la carpeta:\n\n" + CARPETA)
+subidas = st.sidebar.file_uploader("Sube tus imágenes (JPG, PNG o WebP)", type=["jpg", "jpeg", "png", "webp"],
+                                   accept_multiple_files=True)
+
+if len(subidas) == 0:
+    st.title("Compresión de imágenes con SVD")
+    st.info("Sube una o más imágenes desde la barra lateral para empezar. "
+            "Las imágenes no se guardan: solo se usan mientras la página está abierta.")
     st.stop()
 
-archivo = st.sidebar.selectbox("Imagen", archivos)
+indice = st.sidebar.selectbox("Imagen", range(len(subidas)), format_func=lambda i: subidas[i].name)
 metodo_nombre = st.sidebar.radio("Método de SVD", ["SVD clásico", "SVD aleatorio"])
 umbral_error = st.sidebar.slider("Error máximo aceptado (%)", 1, 20, 5) / 100
 velocidad_mbps = st.sidebar.slider("Velocidad de conexión supuesta (Mbps)", 1, 100, 5)
-st.sidebar.caption("Carpeta: " + CARPETA)
 
 
 # ---------------------------------------------------------------
 # CARGA Y SVD (se calculan una sola vez por imagen)
 # ---------------------------------------------------------------
-ruta = os.path.join(CARPETA, archivo)
-modificado = os.path.getmtime(ruta)
-peso_archivo_kb = os.path.getsize(ruta) / 1024
+archivo = subidas[indice].name
+datos = subidas[indice].getvalue()
+extension = extension_de(archivo)
+huella = hashlib.md5(datos).hexdigest()
+peso_archivo_kb = len(datos) / 1024
 
-image = cargar_imagen(ruta, modificado)
+try:
+    image = cargar_imagen(huella, datos, extension)
+except Exception:
+    st.error("No se pudo leer la imagen " + archivo + ". Prueba con otro archivo JPG, PNG o WebP.")
+    st.stop()
 filas, columnas, _ = image.shape
 
+if filas * columnas > MAX_MEGAPIXELES * 1e6:
+    st.error("La imagen " + archivo + " tiene " + f"{filas * columnas / 1e6:.1f}" + " megapíxeles. "
+             "Para no saturar el servidor, esta app acepta hasta " + str(MAX_MEGAPIXELES) + " megapíxeles.")
+    st.stop()
+
 with st.spinner("Calculando el SVD de la imagen (solo la primera vez)..."):
-    svds_clasico, tiempo_clasico = calcular_svd_cache(ruta, modificado, "clasico")
-    svds_aleatorio, tiempo_aleatorio = calcular_svd_cache(ruta, modificado, "aleatorio")
+    svds_clasico, tiempo_clasico = calcular_svd_cache(huella, datos, extension, "clasico")
+    svds_aleatorio, tiempo_aleatorio = calcular_svd_cache(huella, datos, extension, "aleatorio")
 
 if metodo_nombre == "SVD clásico":
     svds, tiempo_svd = svds_clasico, tiempo_clasico
@@ -227,8 +242,8 @@ st.caption(archivo + "  |  " + str(columnas) + " x " + str(filas) + " px  |  " +
 
 zona_imagenes = st.container()
 
-clave_k = "k_" + archivo + "_" + metodo_nombre
-clave_ultimo = "k_ultimo_" + archivo
+clave_k = "k_" + huella + "_" + metodo_nombre
+clave_ultimo = "k_ultimo_" + huella
 cambio_metodo = st.session_state.get("metodo_previo") != metodo_nombre
 st.session_state["metodo_previo"] = metodo_nombre
 if clave_k not in st.session_state or cambio_metodo:
@@ -360,21 +375,27 @@ with tab_comparar:
     plt.close(fig)
 
 with tab_tabla:
-    st.write("Calcula los dos métodos sobre todas las imágenes de la carpeta, con el *k* recomendado del SVD clásico. "
+    st.write("Calcula los dos métodos sobre todas las imágenes subidas, con el *k* recomendado del SVD clásico. "
              "Puede tardar si hay imágenes grandes.")
     if st.button("Calcular tabla de todas las imágenes"):
         filas_tabla = []
+        omitidas = []
         barra = st.progress(0.0, text="Procesando imágenes...")
-        for i, a in enumerate(archivos):
-            barra.progress(i / len(archivos), text="Procesando " + a + " (" + str(i + 1) + " de " + str(len(archivos)) + ")")
-            filas_tabla.append(calcular_fila(a, umbral_error, velocidad_mbps))
+        for i, subida in enumerate(subidas):
+            barra.progress(i / len(subidas), text="Procesando " + subida.name + " (" + str(i + 1) + " de " + str(len(subidas)) + ")")
+            try:
+                filas_tabla.append(calcular_fila(subida.name, subida.getvalue(), umbral_error, velocidad_mbps))
+            except Exception:
+                omitidas.append(subida.name)
         barra.empty()
+        if len(omitidas) > 0:
+            st.warning("Se omitieron (no se pudieron leer o superan los " + str(MAX_MEGAPIXELES) + " megapíxeles): " + ", ".join(omitidas))
         st.session_state["tabla"] = (pd.DataFrame(filas_tabla, columns=ENCABEZADOS), umbral_error, velocidad_mbps)
 
     if "tabla" in st.session_state:
         df, umbral_tabla, velocidad_tabla = st.session_state["tabla"]
         st.caption("Tabla calculada con error máximo de " + f"{umbral_tabla*100:.0f}" + " % y conexión de "
-                   + str(velocidad_tabla) + " Mbps. Si cambias esos valores, vuelve a calcularla.")
+                   + str(velocidad_tabla) + " Mbps. Si cambias esos valores o las imágenes, vuelve a calcularla.")
         st.dataframe(df, width="stretch", hide_index=True)
         csv = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
         st.download_button("Descargar CSV", data=csv, file_name="resultados_svd.csv", mime="text/csv")
